@@ -13,24 +13,28 @@ import java.util.List;
 
 /**
  * InventoryService — stok rezervasyon ve güncelleme işlemleri.
- *
- * Monolith'te bu servis, OrderService ile AYNI transaction içinde çalışır.
- * Sipariş kaydedilirken stok aynı anda rezerve edilir; rollback durumunda
- * her ikisi de geri alınır. Bu "free" atomiklik dağıtık sistemde kaybolur.
- *
- * LAB NOTU (Servis Ayrımı — Lab 3):
- *   Bu sınıf ayrı bir "inventory-service" Spring Boot uygulamasına taşınacak.
- *   OrderService HTTP ile iletişim kuracak.
- *   Ağ kesilmesi, timeout, partial failure senaryoları gözlemlenecek.
- *   Çözüm yolları: Saga (choreography / orchestration), 2PC, Outbox.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class InventoryService {
+public class InventoryService { // Sınıf isminin dosya ismiyle aynı olduğundan emin ol
 
     private final InventoryRepository inventoryRepository;
     private final AuditService        auditService;
+
+    // ─── Controller için Eklenen Metot (Terminal Testi İçin) ───
+
+    /**
+     * Terminalden gelen doğrudan stok düşürme isteğini işler.
+     * Bu metot InventoryController tarafından çağrılır.
+     */
+    @Transactional
+    public void decreaseStock(Long productId, int quantity) {
+        log.info("Terminal istegi ile stok dusurme baslatildi. Ürün: {}, Miktar: {}", productId, quantity);
+
+        // Mevcut deduct mantığını kullanarak işlemi gerçekleştiriyoruz
+        this.deduct(productId, quantity);
+    }
 
     // ─── Queries ──────────────────────────────────────────────
 
@@ -48,17 +52,28 @@ public class InventoryService {
     // ─── Commands ─────────────────────────────────────────────
 
     /**
-     * Sipariş için stok ayır.
-     * Pessimistic lock ile eş zamanlı isteklerde race condition önlenir.
-     *
-     * LAB NOTU:
-     *   Tek instance'ta bu yeterli. Birden fazla backend instance çalıştığında
-     *   DB lock hâlâ işe yarar (DB-level lock). Ama inventory ayrı servise
-     *   taşınırsa bu metot HTTP'ye dönüşür ve DB lock artık kullanılamaz.
+     * Sipariş tesliminde veya doğrudan stok düşümünde fiziksel stoktan düşer.
+     * Pessimistic lock ile race condition önlenir.
      */
     @Transactional
+    public void deduct(Long productId, int quantity) {
+        Inventory inv = inventoryRepository.findByProductIdWithLock(productId)
+                .orElseThrow(() -> new NotFoundException("Inventory not found: " + productId));
+
+        if (inv.getQuantity() < quantity) {
+            throw new InsufficientStockException(productId, inv.getQuantity(), quantity);
+        }
+
+        inv.setQuantity(inv.getQuantity() - quantity);
+        inventoryRepository.save(inv);
+
+        auditService.log("STOCK_DEDUCTED", "Inventory", productId,
+                "qty=" + quantity + " remaining=" + inv.getQuantity());
+        log.info("Stock deducted productId={} qty={} remaining={}", productId, quantity, inv.getQuantity());
+    }
+
+    @Transactional
     public void reserve(Long productId, int quantity) {
-        // TODO LAB-2: yapay gecikme ekle (chaos delay) → race condition gözlemle
         Inventory inv = inventoryRepository.findByProductIdWithLock(productId)
                 .orElseThrow(() -> new NotFoundException("Inventory not found: " + productId));
 
@@ -71,10 +86,8 @@ public class InventoryService {
 
         auditService.log("STOCK_RESERVED", "Inventory", productId,
                 "qty=" + quantity + " remaining=" + inv.availableQuantity());
-        log.info("Stock reserved productId={} qty={} available={}", productId, quantity, inv.availableQuantity());
     }
 
-    /** Sipariş iptalinde rezervasyonu geri bırak. */
     @Transactional
     public void release(Long productId, int quantity) {
         Inventory inv = inventoryRepository.findByProductIdWithLock(productId)
@@ -84,23 +97,8 @@ public class InventoryService {
         inventoryRepository.save(inv);
 
         auditService.log("STOCK_RELEASED", "Inventory", productId, "qty=" + quantity);
-        log.info("Stock released productId={} qty={}", productId, quantity);
     }
 
-    /** Sipariş tesliminde fiziksel stoktan düş. */
-    @Transactional
-    public void deduct(Long productId, int quantity) {
-        Inventory inv = inventoryRepository.findByProductIdWithLock(productId)
-                .orElseThrow(() -> new NotFoundException("Inventory not found: " + productId));
-
-        inv.deduct(quantity);
-        inventoryRepository.save(inv);
-
-        auditService.log("STOCK_DEDUCTED", "Inventory", productId,
-                "qty=" + quantity + " remaining=" + inv.availableQuantity());
-    }
-
-    /** Manuel stok ekle (yeni sevkiyat geldiğinde). */
     @Transactional
     public void addStock(Long productId, int quantity) {
         Inventory inv = inventoryRepository.findByProductIdWithLock(productId)
@@ -111,6 +109,5 @@ public class InventoryService {
 
         auditService.log("STOCK_ADDED", "Inventory", productId,
                 "added=" + quantity + " total=" + inv.getQuantity());
-        log.info("Stock added productId={} qty={} total={}", productId, quantity, inv.getQuantity());
     }
 }
